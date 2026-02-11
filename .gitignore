@@ -1,0 +1,13 @@
+# Frontend
+app/node_modules/
+app/dist/
+app/.vite/
+app/.env
+
+# Move traces and build output
+contracts/inferrail/.coverage*
+contracts/inferrail/.trace
+contracts/inferrail/build/
+
+# OS/editor
+.DS_Store
