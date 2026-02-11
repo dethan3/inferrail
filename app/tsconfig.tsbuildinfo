@@ -1,1 +1,0 @@
-{"root":["./src/App.tsx","./src/main.tsx","./src/types.ts","./src/lib/hash.ts","./src/lib/inferrailClient.ts","./src/lib/mockInferrailClient.ts","./src/lib/suiInferrailClient.ts"],"errors":true,"version":"5.9.3"}

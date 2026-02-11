@@ -3,6 +3,9 @@ app/node_modules/
 app/dist/
 app/.vite/
 app/.env
+app/*.tsbuildinfo
+app/vite.config.js
+app/vite.config.d.ts
 
 # Move traces and build output
 contracts/inferrail/.coverage*
