@@ -1,5 +1,14 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import {
+  ConnectButton,
+  useCurrentAccount,
+  useCurrentWallet,
+  useDisconnectWallet,
+  useSignAndExecuteTransaction,
+  useSuiClientContext,
+} from '@mysten/dapp-kit';
 
+import { normalizeAddress, shortAddress } from './lib/address';
 import { type InferrailClient } from './lib/inferrailClient';
 import { sha256Hex } from './lib/hash';
 import {
@@ -15,6 +24,12 @@ type ClientMode = 'mock' | 'sui';
 type ActorRole = 'requester' | 'worker';
 type SuiNetwork = 'testnet' | 'devnet' | 'mainnet';
 
+type AppEnv = Record<string, string | undefined>;
+
+const APP_ENV: AppEnv = (import.meta as ImportMeta & { env?: AppEnv }).env ?? {};
+const DEFAULT_REQUESTER_ADDRESS = '0xA11CE';
+const DEFAULT_WORKER_ADDRESS = '0xB0B';
+
 const statusLabel: Record<JobStatus, string> = {
   Created: 'Created',
   Accepted: 'Accepted',
@@ -22,6 +37,13 @@ const statusLabel: Record<JobStatus, string> = {
   Settled: 'Settled',
   Refunded: 'Refunded',
 };
+
+function normalizeNetwork(value: string | undefined): SuiNetwork {
+  if (value === 'devnet' || value === 'mainnet' || value === 'testnet') {
+    return value;
+  }
+  return 'testnet';
+}
 
 function fmtTime(ms: number): string {
   return new Date(ms).toLocaleString();
@@ -63,12 +85,13 @@ function statusClass(status: JobStatus): string {
 }
 
 export default function App(): JSX.Element {
-  const [mode, setMode] = useState<ClientMode>('mock');
+  const hasPackageId = (APP_ENV.VITE_INFERRAIL_PACKAGE_ID ?? '').trim().length > 2;
+  const [mode, setMode] = useState<ClientMode>(hasPackageId ? 'sui' : 'mock');
   const [jobs, setJobs] = useState<Job[]>([]);
   const [selectedJobId, setSelectedJobId] = useState<string | null>(null);
 
-  const [requesterAddress, setRequesterAddress] = useState('0xA11CE');
-  const [workerAddress, setWorkerAddress] = useState('0xB0B');
+  const [requesterAddress, setRequesterAddress] = useState(DEFAULT_REQUESTER_ADDRESS);
+  const [workerAddress, setWorkerAddress] = useState(DEFAULT_WORKER_ADDRESS);
   const [actorRole, setActorRole] = useState<ActorRole>('requester');
 
   const [description, setDescription] = useState('Run llama3.1 inference on customer prompts');
@@ -79,13 +102,101 @@ export default function App(): JSX.Element {
   const [resultBody, setResultBody] = useState('{"output":"answer"}');
   const [resultHash, setResultHash] = useState('');
 
-  const [suiNetwork, setSuiNetwork] = useState<SuiNetwork>('testnet');
-  const [suiCoinType, setSuiCoinType] = useState('0x2::sui::SUI');
-  const [suiPaymentCoinObjectId, setSuiPaymentCoinObjectId] = useState('');
+  const [suiNetwork, setSuiNetwork] = useState<SuiNetwork>(
+    normalizeNetwork(APP_ENV.VITE_SUI_NETWORK),
+  );
+  const [suiCoinType, setSuiCoinType] = useState(
+    APP_ENV.VITE_INFERRAIL_COIN_TYPE ?? '0x2::sui::SUI',
+  );
+  const [suiPaymentCoinObjectId, setSuiPaymentCoinObjectId] = useState(
+    APP_ENV.VITE_INFERRAIL_PAYMENT_COIN_OBJECT_ID ?? '',
+  );
 
   const [pending, setPending] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
+
+  const { client: suiClient, network: activeSuiNetwork, selectNetwork } = useSuiClientContext();
+  const currentAccount = useCurrentAccount();
+  const { currentWallet, connectionStatus } = useCurrentWallet();
+  const { mutateAsync: disconnectWallet, isPending: disconnectingWallet } = useDisconnectWallet();
+  const { mutateAsync: signAndExecuteTransaction } = useSignAndExecuteTransaction();
+
+  const walletAddress = currentAccount ? normalizeAddress(currentAccount.address) : null;
+  const walletProvider = currentWallet?.name ?? 'none';
+
+  const signerAddressRef = useRef<string | null>(walletAddress);
+  const signAndExecuteRef = useRef(signAndExecuteTransaction);
+
+  useEffect(() => {
+    signerAddressRef.current = walletAddress;
+  }, [walletAddress]);
+
+  useEffect(() => {
+    signAndExecuteRef.current = signAndExecuteTransaction;
+  }, [signAndExecuteTransaction]);
+
+  useEffect(() => {
+    if (!walletAddress) {
+      return;
+    }
+
+    const requesterIsPlaceholder =
+      requesterAddress.trim() === '' ||
+      normalizeAddress(requesterAddress) === normalizeAddress(DEFAULT_REQUESTER_ADDRESS);
+    const workerIsPlaceholder =
+      workerAddress.trim() === '' ||
+      normalizeAddress(workerAddress) === normalizeAddress(DEFAULT_WORKER_ADDRESS);
+
+    if (requesterIsPlaceholder) {
+      setRequesterAddress(walletAddress);
+    }
+    if (workerIsPlaceholder) {
+      setWorkerAddress(walletAddress);
+    }
+  }, [requesterAddress, walletAddress, workerAddress]);
+
+  const signerProvider = useCallback(() => {
+    const address = signerAddressRef.current;
+    if (!address) {
+      return null;
+    }
+    return {
+      address,
+      signAndExecuteTransaction: async (txBytes: string) =>
+        signAndExecuteRef.current({ transaction: txBytes }),
+    };
+  }, []);
+
+  const autoSelectPaymentCoin = useCallback(
+    async (silent: boolean): Promise<string | null> => {
+      if (mode !== 'sui' || !walletAddress) {
+        return null;
+      }
+
+      const coins = await suiClient.getCoins({
+        owner: walletAddress,
+        coinType: suiCoinType,
+        limit: 1,
+      });
+      const coinObjectId = coins.data[0]?.coinObjectId ?? null;
+      if (!coinObjectId) {
+        if (!silent) {
+          setError(
+            `No ${suiCoinType} coin object found for wallet ${shortAddress(walletAddress)}. Request faucet funds first.`,
+          );
+        }
+        return null;
+      }
+
+      setSuiPaymentCoinObjectId((prev) => (prev.trim() === coinObjectId ? prev : coinObjectId));
+      if (!silent) {
+        setNotice(`Auto-selected payment coin: ${shortAddress(coinObjectId)}`);
+      }
+      return coinObjectId;
+    },
+    [mode, suiClient, suiCoinType, walletAddress],
+  );
 
   const client: InferrailClient = useMemo(() => {
     if (mode === 'sui') {
@@ -93,10 +204,11 @@ export default function App(): JSX.Element {
         network: suiNetwork,
         defaultCoinType: suiCoinType,
         defaultPaymentCoinObjectId: suiPaymentCoinObjectId,
+        signerProvider,
       });
     }
     return new MockInferrailClient();
-  }, [mode, suiCoinType, suiNetwork, suiPaymentCoinObjectId]);
+  }, [mode, signerProvider, suiCoinType, suiNetwork, suiPaymentCoinObjectId]);
 
   const selectedJob = useMemo(
     () => jobs.find((item) => item.id === selectedJobId) ?? null,
@@ -138,6 +250,19 @@ export default function App(): JSX.Element {
       setError('Requester address cannot be empty');
       return;
     }
+    let paymentCoinObjectId: string | undefined;
+    if (mode === 'sui') {
+      const resolvedPaymentCoinObjectId =
+        (await autoSelectPaymentCoin(true)) ?? suiPaymentCoinObjectId.trim();
+      paymentCoinObjectId = resolvedPaymentCoinObjectId || undefined;
+      if (!paymentCoinObjectId) {
+        setError(
+          `No ${suiCoinType} coin object available for current wallet. Request faucet funds first.`,
+        );
+        return;
+      }
+    }
+
     const deadlineMs = Date.now() + deadlineMinutes * 60_000;
     await withAction(async () => {
       const created = await client.createJob({
@@ -146,7 +271,7 @@ export default function App(): JSX.Element {
         deadlineMs,
         requester: cleanRequester,
         coinType: mode === 'sui' ? suiCoinType : undefined,
-        paymentCoinObjectId: mode === 'sui' ? suiPaymentCoinObjectId.trim() : undefined,
+        paymentCoinObjectId,
       });
       setSelectedJobId(created.id);
     }, 'Job created and escrow locked');
@@ -226,11 +351,56 @@ export default function App(): JSX.Element {
     setNotice('Seeded scenario B: timeout refund candidate');
   }
 
+  async function onDisconnectWallet(): Promise<void> {
+    setError(null);
+    setNotice(null);
+    try {
+      await disconnectWallet();
+      setNotice('Wallet disconnected.');
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    }
+  }
+
+  function onUseWalletForActiveRole(): void {
+    if (!walletAddress) {
+      return;
+    }
+    if (actorRole === 'requester') {
+      setRequesterAddress(walletAddress);
+    } else {
+      setWorkerAddress(walletAddress);
+    }
+    setNotice(`Synced ${actorRole} address from wallet.`);
+  }
+
   useEffect(() => {
     refreshJobs().catch((err: unknown) => {
       setError(err instanceof Error ? err.message : String(err));
     });
   }, [client]);
+
+  useEffect(() => {
+    const nextNetwork = normalizeNetwork(activeSuiNetwork);
+    if (nextNetwork !== suiNetwork) {
+      setSuiNetwork(nextNetwork);
+    }
+  }, [activeSuiNetwork, suiNetwork]);
+
+  useEffect(() => {
+    if (mode === 'sui' && activeSuiNetwork !== suiNetwork) {
+      selectNetwork(suiNetwork);
+    }
+  }, [activeSuiNetwork, mode, selectNetwork, suiNetwork]);
+
+  useEffect(() => {
+    if (mode !== 'sui' || !walletAddress) {
+      return;
+    }
+    autoSelectPaymentCoin(true).catch(() => {
+      // ignore background auto-select errors
+    });
+  }, [autoSelectPaymentCoin, mode, walletAddress, activeSuiNetwork, suiCoinType]);
 
   const canAccept =
     selectedJob !== null &&
@@ -260,6 +430,14 @@ export default function App(): JSX.Element {
     isExpired(selectedJob) &&
     actorRole === 'requester' &&
     selectedJob.requester === requesterAddress.trim();
+
+  const isWalletRequired = mode === 'sui';
+  const walletConnected = Boolean(walletAddress);
+  const signerMismatch =
+    isWalletRequired &&
+    walletConnected &&
+    actorAddress !== '' &&
+    normalizeAddress(actorAddress) !== normalizeAddress(walletAddress ?? '');
 
   return (
     <div className="page">
@@ -293,6 +471,35 @@ export default function App(): JSX.Element {
           >
             Seed Scenario B
           </button>
+        </div>
+        <div className="wallet-bar">
+          <div className="wallet-meta">
+            <strong>Wallet</strong>
+            <span>{walletConnected ? shortAddress(walletAddress ?? '') : 'Not connected'}</span>
+            <small className="muted">Provider: {walletProvider}</small>
+            <small className="muted">Status: {connectionStatus}</small>
+          </div>
+          <div className="action-row">
+            <ConnectButton
+              className="ghost"
+              connectText="Connect Wallet"
+              disabled={pending || mode !== 'sui'}
+            />
+            <button
+              className="ghost"
+              onClick={() => onDisconnectWallet()}
+              disabled={pending || disconnectingWallet || !walletConnected || mode !== 'sui'}
+            >
+              Disconnect
+            </button>
+            <button
+              className="ghost"
+              onClick={() => onUseWalletForActiveRole()}
+              disabled={pending || !walletConnected}
+            >
+              Use As {actorRole}
+            </button>
+          </div>
         </div>
       </header>
 
@@ -335,7 +542,11 @@ export default function App(): JSX.Element {
                 <span>Sui Network</span>
                 <select
                   value={suiNetwork}
-                  onChange={(e) => setSuiNetwork(e.target.value as SuiNetwork)}
+                  onChange={(e) => {
+                    const nextNetwork = e.target.value as SuiNetwork;
+                    setSuiNetwork(nextNetwork);
+                    selectNetwork(nextNetwork);
+                  }}
                 >
                   <option value="testnet">testnet</option>
                   <option value="devnet">devnet</option>
@@ -361,6 +572,20 @@ export default function App(): JSX.Element {
                   onChange={(e) => setSuiPaymentCoinObjectId(e.target.value)}
                   placeholder="0x..."
                 />
+                <button
+                  type="button"
+                  className="ghost"
+                  onClick={() => {
+                    setError(null);
+                    setNotice(null);
+                    autoSelectPaymentCoin(false).catch((err) => {
+                      setError(err instanceof Error ? err.message : String(err));
+                    });
+                  }}
+                  disabled={pending || !walletConnected}
+                >
+                  Auto Select Wallet Coin
+                </button>
               </label>
             )}
           </div>
@@ -393,13 +618,21 @@ export default function App(): JSX.Element {
               />
             </label>
           </div>
-          <button onClick={() => onCreateJob()} disabled={pending}>
+          <button onClick={() => onCreateJob()} disabled={pending || (isWalletRequired && !walletConnected)}>
             Create + Lock Escrow
           </button>
           {mode === 'sui' && (
             <p className="muted">
-              Sui mode uses injected wallet signing. The active wallet account must match requester or worker address.
+              Sui mode uses dapp-kit wallet signing. The active wallet account must match requester or worker address.
               Budget is derived from the selected payment coin object and network is {suiNetwork}.
+            </p>
+          )}
+          {mode === 'sui' && !walletConnected && (
+            <p className="error">Connect wallet first, then sync requester/worker address.</p>
+          )}
+          {mode === 'sui' && walletConnected && signerMismatch && (
+            <p className="error">
+              Wallet signer does not match current {actorRole} address. Use "Use As {actorRole}" or edit address.
             </p>
           )}
         </section>
@@ -454,13 +687,22 @@ export default function App(): JSX.Element {
 
               <h3>Actions</h3>
               <div className="action-row">
-                <button disabled={!canAccept || pending} onClick={() => onAccept(selectedJob)}>
+                <button
+                  disabled={!canAccept || pending || (isWalletRequired && !walletConnected)}
+                  onClick={() => onAccept(selectedJob)}
+                >
                   Accept Job
                 </button>
-                <button disabled={!canSettle || pending} onClick={() => onSettle(selectedJob)}>
+                <button
+                  disabled={!canSettle || pending || (isWalletRequired && !walletConnected)}
+                  onClick={() => onSettle(selectedJob)}
+                >
                   Settle
                 </button>
-                <button disabled={!canRefund || pending} onClick={() => onRefund(selectedJob)}>
+                <button
+                  disabled={!canRefund || pending || (isWalletRequired && !walletConnected)}
+                  onClick={() => onRefund(selectedJob)}
+                >
                   Refund (Timeout)
                 </button>
               </div>
@@ -481,7 +723,7 @@ export default function App(): JSX.Element {
                     Generate Hash
                   </button>
                   <button
-                    disabled={!canSubmit || pending}
+                    disabled={!canSubmit || pending || (isWalletRequired && !walletConnected)}
                     onClick={() => onSubmit(selectedJob)}
                   >
                     Submit

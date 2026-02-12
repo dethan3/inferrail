@@ -110,6 +110,35 @@ h1 {
   flex-wrap: wrap;
 }
 
+.wallet-bar {
+  margin-top: 14px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  padding: 12px;
+  background: color-mix(in srgb, #f4f8f7 80%, white 20%);
+  display: flex;
+  gap: 12px;
+  justify-content: space-between;
+  align-items: center;
+  flex-wrap: wrap;
+}
+
+.wallet-meta {
+  display: grid;
+  gap: 2px;
+}
+
+.wallet-meta > span {
+  font-family: 'Sora', 'Avenir Next', 'Trebuchet MS', sans-serif;
+  font-size: 14px;
+}
+
+.wallet-picker {
+  min-width: 220px;
+  display: grid;
+  gap: 4px;
+}
+
 .layout {
   display: grid;
   grid-template-columns: 1.1fr 1fr 1.2fr;

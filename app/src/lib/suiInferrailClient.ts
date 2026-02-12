@@ -7,6 +7,7 @@ import {
   type SubmitResultInput,
   type TimelineEvent,
 } from '../types';
+import { normalizeAddress } from './address';
 import { type InferrailClient } from './inferrailClient';
 
 interface SuiRpcCursor {
@@ -26,6 +27,13 @@ interface SuiQueryEventsResponse {
   hasNextPage: boolean;
 }
 
+export interface SuiSignerContext {
+  address: string;
+  signAndExecuteTransaction: (txBytes: string) => Promise<unknown>;
+}
+
+type SuiSignerProvider = () => SuiSignerContext | null;
+
 interface SuiClientConfig {
   network: SuiNetwork;
   rpcUrl: string;
@@ -34,43 +42,10 @@ interface SuiClientConfig {
   defaultGasBudget: number;
   defaultPaymentCoinObjectId: string;
   clockObjectId: string;
+  signerProvider?: SuiSignerProvider;
 }
 
 type SuiNetwork = 'testnet' | 'devnet' | 'mainnet';
-
-type WalletAccount = string | { address?: string };
-
-interface InjectedWallet {
-  hasPermissions?: (permissions: string[]) => Promise<boolean>;
-  requestPermissions?: (permissions: string[]) => Promise<unknown>;
-  getAccounts?: () => Promise<WalletAccount[]>;
-  getAccount?: () => Promise<WalletAccount>;
-  executeMoveCall?: (input: {
-    packageObjectId: string;
-    module: string;
-    function: string;
-    typeArguments?: string[];
-    arguments?: unknown[];
-    gasBudget?: number;
-  }) => Promise<unknown>;
-  signAndExecuteTransactionBlock?: (input: {
-    transactionBlock: string;
-    options?: Record<string, unknown>;
-    requestType?: string;
-  }) => Promise<unknown>;
-}
-
-declare global {
-  interface Window {
-    suiWallet?: InjectedWallet;
-    slush?: InjectedWallet;
-    martian?: InjectedWallet;
-  }
-}
-
-function normalizeAddress(value: string): string {
-  return value.toLowerCase();
-}
 
 function numberFromUnknown(value: unknown): number {
   if (typeof value === 'number') {
@@ -128,26 +103,6 @@ function hexToBytes(hex: string): number[] {
     bytes.push(Number.parseInt(clean.slice(i, i + 2), 16));
   }
   return bytes;
-}
-
-function findWalletFromWindow(): InjectedWallet | null {
-  if (typeof window === 'undefined') {
-    return null;
-  }
-  return window.suiWallet ?? window.slush ?? window.martian ?? null;
-}
-
-function getAddressFromWalletAccount(account: WalletAccount | null | undefined): string | null {
-  if (!account) {
-    return null;
-  }
-  if (typeof account === 'string') {
-    return account;
-  }
-  if (typeof account.address === 'string') {
-    return account.address;
-  }
-  return null;
 }
 
 function digestFromWalletResult(result: unknown): string | null {
@@ -222,6 +177,7 @@ export class SuiInferrailClient implements InferrailClient {
       defaultGasBudget: config?.defaultGasBudget ?? 100_000_000,
       defaultPaymentCoinObjectId: config?.defaultPaymentCoinObjectId ?? envCoinObjectId ?? '',
       clockObjectId: config?.clockObjectId ?? '0x6',
+      signerProvider: config?.signerProvider,
     };
   }
 
@@ -247,7 +203,7 @@ export class SuiInferrailClient implements InferrailClient {
     };
 
     if (payload.error) {
-      throw new Error(payload.error.message ?? 'Unknown RPC error');
+      throw new Error(`${method} failed: ${payload.error.message ?? 'Unknown RPC error'}`);
     }
 
     if (!payload.result) {
@@ -282,44 +238,18 @@ export class SuiInferrailClient implements InferrailClient {
     return this.config.packageId;
   }
 
-  private requireWallet(): InjectedWallet {
-    const wallet = findWalletFromWindow();
-    if (!wallet) {
-      throw new Error('No injected Sui wallet found. Install/enable a Sui wallet extension.');
+  private requireSigner(): SuiSignerContext {
+    const signer = this.config.signerProvider?.();
+    if (!signer) {
+      throw new Error('No connected wallet found. Connect a wallet before sending transactions.');
     }
-    return wallet;
-  }
-
-  private async ensureWalletPermission(wallet: InjectedWallet): Promise<void> {
-    if (!wallet.requestPermissions) {
-      return;
+    if (!signer.address.trim()) {
+      throw new Error('Connected wallet did not expose a signer address.');
     }
-    if (wallet.hasPermissions) {
-      const granted = await wallet.hasPermissions(['viewAccount', 'suggestTransactions']);
-      if (granted) {
-        return;
-      }
+    if (typeof signer.signAndExecuteTransaction !== 'function') {
+      throw new Error('Connected wallet does not support transaction execution.');
     }
-    await wallet.requestPermissions(['viewAccount', 'suggestTransactions']);
-  }
-
-  private async walletAddress(wallet: InjectedWallet): Promise<string> {
-    if (wallet.getAccounts) {
-      const accounts = await wallet.getAccounts();
-      const first = accounts[0] ?? null;
-      const address = getAddressFromWalletAccount(first);
-      if (address) {
-        return normalizeAddress(address);
-      }
-    }
-    if (wallet.getAccount) {
-      const account = await wallet.getAccount();
-      const address = getAddressFromWalletAccount(account);
-      if (address) {
-        return normalizeAddress(address);
-      }
-    }
-    throw new Error('Unable to read wallet account. Connect wallet and unlock it first.');
+    return signer;
   }
 
   private async buildUnsafeMoveCallTx(params: {
@@ -331,15 +261,21 @@ export class SuiInferrailClient implements InferrailClient {
     gasBudget: number;
   }): Promise<string> {
     const pkg = this.requirePackageId();
+    const suiJsonArguments = params.arguments.map((value) => {
+      if (typeof value === 'number' || typeof value === 'bigint') {
+        return String(value);
+      }
+      return value;
+    });
     const response = await this.rpcCall<UnsafeMoveCallResponse>('unsafe_moveCall', [
       params.signer,
       pkg,
       params.module,
       params.func,
       params.typeArguments,
-      params.arguments,
+      suiJsonArguments,
       null,
-      params.gasBudget,
+      String(params.gasBudget),
     ]);
     const txBytes = response.txBytes ?? response.tx_bytes;
     if (!txBytes) {
@@ -357,48 +293,23 @@ export class SuiInferrailClient implements InferrailClient {
     gasBudget?: number;
   }): Promise<string> {
     this.requirePackageId();
-    const wallet = this.requireWallet();
-    await this.ensureWalletPermission(wallet);
-
-    const signer = await this.walletAddress(wallet);
+    const signerContext = this.requireSigner();
+    const signer = normalizeAddress(signerContext.address);
     if (normalizeAddress(params.expectedSigner) !== signer) {
       throw new Error(`Wallet signer mismatch. Expected ${params.expectedSigner}, got ${signer}`);
     }
 
     const gasBudget = params.gasBudget ?? this.config.defaultGasBudget;
-
-    if (wallet.executeMoveCall) {
-      const result = await wallet.executeMoveCall({
-        packageObjectId: this.config.packageId,
-        module: params.module,
-        function: params.func,
-        typeArguments: params.typeArguments,
-        arguments: params.arguments,
-        gasBudget,
-      });
-      return digestFromWalletResult(result) ?? '';
-    }
-
-    if (wallet.signAndExecuteTransactionBlock) {
-      const txBytes = await this.buildUnsafeMoveCallTx({
-        signer,
-        module: params.module,
-        func: params.func,
-        typeArguments: params.typeArguments,
-        arguments: params.arguments,
-        gasBudget,
-      });
-      const result = await wallet.signAndExecuteTransactionBlock({
-        transactionBlock: txBytes,
-        options: {
-          showEffects: true,
-        },
-        requestType: 'WaitForLocalExecution',
-      });
-      return digestFromWalletResult(result) ?? '';
-    }
-
-    throw new Error('Wallet does not support move call execution in this build.');
+    const txBytes = await this.buildUnsafeMoveCallTx({
+      signer,
+      module: params.module,
+      func: params.func,
+      typeArguments: params.typeArguments,
+      arguments: params.arguments,
+      gasBudget,
+    });
+    const result = await signerContext.signAndExecuteTransaction(txBytes);
+    return digestFromWalletResult(result) ?? '';
   }
 
   private async waitForJob(jobId: string): Promise<Job> {
